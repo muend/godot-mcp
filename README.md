@@ -100,6 +100,21 @@ With environment variables:
 claude mcp add godot -e GODOT_PATH=/path/to/godot -e DEBUG=true -- npx @coding-solo/godot-mcp
 ```
 
+### Codex CLI
+
+Add the built server to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.godot]
+command = "node"
+args = ["<repo>/build/index.js"]
+
+[mcp_servers.godot.env]
+GODOT_PATH = "<godot-executable>"
+```
+
+Restart Codex CLI after building the server so it reloads the tool list.
+
 <details>
 <summary><strong>Cline</strong></summary>
 
