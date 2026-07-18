@@ -64,6 +64,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **Launch Godot Editor**: Open the Godot editor for a specific project
 - **Run Godot Projects**: Execute Godot projects in debug mode
 - **Run Godot Scenes**: Execute a specific scene with configurable timeout and captured output
+- **Run Scene Tests**: Execute a test scene and return structured pass/fail results
 - **Validate GDScript**: Check one or all project scripts and return structured errors
 - **Capture Debug Output**: Retrieve console output and error messages
 - **Control Execution**: Start and stop Godot projects programmatically
@@ -97,6 +98,34 @@ Use `run_scene` for an F6-style run of one scene while keeping output compatible
   "timeoutMs": 30000
 }
 ```
+
+### Run a Scene Test
+
+Use `run_scene_test` when an agent needs structured test results instead of raw console output. Matching is literal and configurable, so the tool is not tied to a specific test framework.
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `projectPath` | Yes | Path to the directory containing `project.godot` |
+| `scenePath` | Yes | A `res://` path or path relative to the project |
+| `timeoutMs` | No | Maximum wait time; defaults to `60000` milliseconds |
+| `passPattern` | No | Text identifying a passing line; defaults to `✔` |
+| `failPattern` | No | Text identifying a failing line; defaults to `✘` |
+| `donePattern` | No | Text identifying completion; defaults to `SONUÇ:` |
+| `autoQuit` | No | Stops the scene when completion is detected; defaults to `true` |
+
+```json
+{
+  "projectPath": "/path/to/project",
+  "scenePath": "res://tests/smoke_test.tscn",
+  "timeoutMs": 60000,
+  "passPattern": "PASS:",
+  "failPattern": "FAIL:",
+  "donePattern": "RESULT:",
+  "autoQuit": true
+}
+```
+
+The response includes `completed`, pass/fail counts, matching lines, and the last 50 output lines in `rawTail`.
 
 ## Requirements
 
@@ -139,6 +168,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "launch_editor",
         "run_project",
         "run_scene",
+        "run_scene_test",
         "validate_script",
         "get_debug_output",
         "stop_project",
