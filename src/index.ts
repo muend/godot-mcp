@@ -8,8 +8,8 @@
  */
 
 import { fileURLToPath } from 'url';
-import { join, dirname, basename, normalize, isAbsolute } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { join, dirname, basename, normalize, isAbsolute, relative, sep } from 'path';
+import { existsSync, readdirSync, mkdirSync, readFileSync } from 'fs';
 import { spawn, execFile, type ChildProcessWithoutNullStreams } from 'child_process';
 import { promisify } from 'util';
 
@@ -43,6 +43,18 @@ interface GodotProcess {
   output: string[];
   errors: string[];
   timeout?: NodeJS.Timeout;
+}
+
+interface ScriptValidationError {
+  file: string;
+  line: number;
+  message: string;
+}
+
+interface GodotCheckResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
 }
 
 /**
@@ -727,6 +739,35 @@ class GodotServer {
           },
         },
         {
+          name: 'validate_script',
+          description: 'Validate one or all GDScript files in a Godot project',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scriptPath: {
+                type: 'string',
+                description: 'Single .gd file to validate, as a res:// path or path relative to the project',
+              },
+              all: {
+                type: 'boolean',
+                description: 'Validate every .gd file in the project',
+              },
+            },
+            required: ['projectPath'],
+            oneOf: [
+              { required: ['scriptPath'] },
+              {
+                properties: { all: { const: true } },
+                required: ['all'],
+              },
+            ],
+          },
+        },
+        {
           name: 'get_debug_output',
           description: 'Get the current debug output and errors',
           inputSchema: {
@@ -963,6 +1004,8 @@ class GodotServer {
           return await this.handleRunProject(request.params.arguments);
         case 'run_scene':
           return await this.handleRunScene(request.params.arguments);
+        case 'validate_script':
+          return await this.handleValidateScript(request.params.arguments);
         case 'get_debug_output':
           return await this.handleGetDebugOutput();
         case 'stop_project':
@@ -1253,6 +1296,287 @@ class GodotServer {
         ]
       );
     }
+  }
+
+  /**
+   * Handle the validate_script tool
+   * @param args Tool arguments
+   */
+  private async handleValidateScript(args: unknown) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return this.createErrorResponse(
+        'Project path and a validation mode are required',
+        ['Provide projectPath with either scriptPath or all: true']
+      );
+    }
+
+    const rawArgs = args as Record<string, unknown>;
+    const projectPath = rawArgs.projectPath ?? rawArgs.project_path;
+    const scriptPath = rawArgs.scriptPath ?? rawArgs.script_path;
+    const validateAll = rawArgs.all;
+
+    if (typeof projectPath !== 'string' || !projectPath.trim()) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (scriptPath !== undefined && (typeof scriptPath !== 'string' || !scriptPath.trim())) {
+      return this.createErrorResponse(
+        'scriptPath must be a non-empty string',
+        ['Provide a res:// .gd path or a path relative to the project']
+      );
+    }
+
+    if (validateAll !== undefined && typeof validateAll !== 'boolean') {
+      return this.createErrorResponse(
+        'all must be a boolean',
+        ['Use all: true to validate every .gd file in the project']
+      );
+    }
+
+    const hasScriptPath = typeof scriptPath === 'string';
+    if (hasScriptPath === (validateAll === true)) {
+      return this.createErrorResponse(
+        'Choose exactly one validation mode',
+        ['Provide either scriptPath or all: true, but not both']
+      );
+    }
+
+    if (!this.validatePath(projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    const projectFile = join(projectPath, 'project.godot');
+    if (!existsSync(projectFile)) {
+      return this.createErrorResponse(
+        `Not a valid Godot project: ${projectPath}`,
+        [
+          'Ensure the path points to a directory containing a project.godot file',
+          'Use list_projects to find valid Godot projects',
+        ]
+      );
+    }
+
+    try {
+      const autoloadNames = this.getProjectAutoloadNames(projectFile);
+      let scripts: string[];
+
+      if (hasScriptPath) {
+        if (!this.validatePath(scriptPath) || isAbsolute(scriptPath)) {
+          return this.createErrorResponse(
+            'Invalid script path',
+            ['Provide a res:// .gd path or a path relative to the project without ".."']
+          );
+        }
+
+        const resourcePath = this.toGodotResourcePath(scriptPath);
+        if (!resourcePath.toLowerCase().endsWith('.gd')) {
+          return this.createErrorResponse(
+            'scriptPath must point to a .gd file',
+            ['Provide the path of a GDScript file']
+          );
+        }
+
+        const filePath = join(projectPath, resourcePath.slice('res://'.length));
+        if (!existsSync(filePath)) {
+          return this.createErrorResponse(
+            `Script does not exist: ${scriptPath}`,
+            ['Ensure scriptPath is correct and belongs to the project']
+          );
+        }
+        scripts = [resourcePath];
+      } else {
+        scripts = this.findGodotScripts(projectPath);
+      }
+
+      const errors: ScriptValidationError[] = [];
+      for (const resourcePath of scripts) {
+        const result = await this.runGodotScriptCheck(projectPath, resourcePath);
+        errors.push(...this.parseGodotScriptErrors(result, resourcePath, autoloadNames));
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                valid: errors.length === 0,
+                errors,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      return this.createErrorResponse(
+        `Failed to validate GDScript: ${errorMessage}`,
+        [
+          'Ensure Godot is installed correctly',
+          'Check if the GODOT_PATH environment variable is set correctly',
+          'Verify the project and script paths are accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Convert a project-relative script path to Godot's res:// format.
+   */
+  private toGodotResourcePath(scriptPath: string): string {
+    const relativePath = scriptPath.startsWith('res://')
+      ? scriptPath.slice('res://'.length)
+      : scriptPath;
+    return `res://${relativePath.split('\\').join('/')}`;
+  }
+
+  /**
+   * Find GDScript files in a project, excluding generated metadata directories.
+   */
+  private findGodotScripts(projectPath: string): string[] {
+    const scripts: string[] = [];
+
+    const scanDirectory = (directory: string): void => {
+      const entries = readdirSync(directory, { withFileTypes: true })
+        .sort((left, right) => left.name.localeCompare(right.name));
+
+      for (const entry of entries) {
+        if (entry.name === '.git' || entry.name === '.godot') {
+          continue;
+        }
+
+        const entryPath = join(directory, entry.name);
+        if (entry.isDirectory()) {
+          scanDirectory(entryPath);
+        } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.gd')) {
+          const projectRelativePath = relative(projectPath, entryPath).split(sep).join('/');
+          scripts.push(`res://${projectRelativePath}`);
+        }
+      }
+    };
+
+    scanDirectory(projectPath);
+    return scripts;
+  }
+
+  /**
+   * Read configured autoload singleton names from project.godot.
+   */
+  private getProjectAutoloadNames(projectFile: string): Set<string> {
+    const autoloadNames = new Set<string>();
+    const lines = readFileSync(projectFile, 'utf8').split(/\r?\n/);
+    let inAutoloadSection = false;
+
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+      if (trimmedLine.startsWith('[') && trimmedLine.endsWith(']')) {
+        inAutoloadSection = trimmedLine === '[autoload]';
+        continue;
+      }
+
+      if (!inAutoloadSection || !trimmedLine || trimmedLine.startsWith(';')) {
+        continue;
+      }
+
+      const separatorIndex = trimmedLine.indexOf('=');
+      if (separatorIndex > 0) {
+        const name = trimmedLine.slice(0, separatorIndex).trim();
+        if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+          autoloadNames.add(name);
+        }
+      }
+    }
+
+    return autoloadNames;
+  }
+
+  /**
+   * Run Godot's check-only mode for a single GDScript file.
+   */
+  private runGodotScriptCheck(projectPath: string, resourcePath: string): Promise<GodotCheckResult> {
+    return new Promise((resolve, reject) => {
+      const childProcess = spawn(
+        this.godotPath!,
+        ['--headless', '--path', projectPath, '--check-only', '--script', resourcePath],
+        { stdio: 'pipe' }
+      );
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+
+      childProcess.stdout.on('data', (data: Buffer) => stdout.push(data));
+      childProcess.stderr.on('data', (data: Buffer) => stderr.push(data));
+      childProcess.on('error', reject);
+      childProcess.on('close', (exitCode: number | null) => {
+        resolve({
+          exitCode: exitCode ?? -1,
+          stdout: Buffer.concat(stdout).toString(),
+          stderr: Buffer.concat(stderr).toString(),
+        });
+      });
+    });
+  }
+
+  /**
+   * Parse Godot script errors and ignore check-only autoload resolution false positives.
+   */
+  private parseGodotScriptErrors(
+    result: GodotCheckResult,
+    fallbackFile: string,
+    autoloadNames: Set<string>
+  ): ScriptValidationError[] {
+    const errors: ScriptValidationError[] = [];
+    const lines = `${result.stdout}\n${result.stderr}`.split(/\r?\n/);
+    let pendingError: { kind: string; message: string } | null = null;
+
+    for (const line of lines) {
+      const errorMatch = line.match(/^SCRIPT ERROR:\s+(Parse|Compile) Error:\s*(.+)$/);
+      if (errorMatch) {
+        pendingError = { kind: errorMatch[1], message: errorMatch[2].trim() };
+        continue;
+      }
+
+      const locationMatch = line.match(/GDScript::reload\s+\((res:\/\/.+):(\d+)\)/);
+      if (!pendingError || !locationMatch) {
+        continue;
+      }
+
+      const missingIdentifier = pendingError.message.match(/^Identifier not found:\s*([A-Za-z_][A-Za-z0-9_]*)$/);
+      const isAutoloadFalsePositive = pendingError.kind === 'Compile'
+        && missingIdentifier !== null
+        && autoloadNames.has(missingIdentifier[1]);
+
+      if (!isAutoloadFalsePositive) {
+        errors.push({
+          file: locationMatch[1],
+          line: Number.parseInt(locationMatch[2], 10),
+          message: pendingError.message,
+        });
+      }
+      pendingError = null;
+    }
+
+    if (pendingError) {
+      errors.push({ file: fallbackFile, line: 0, message: pendingError.message });
+    } else if (result.exitCode !== 0 && errors.length === 0) {
+      const fallbackMessage = result.stderr
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => line && !line.startsWith('WARNING:'));
+
+      if (fallbackMessage && !fallbackMessage.startsWith('SCRIPT ERROR:')) {
+        errors.push({ file: fallbackFile, line: 0, message: fallbackMessage });
+      }
+    }
+
+    return errors;
   }
 
   /**

@@ -64,6 +64,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **Launch Godot Editor**: Open the Godot editor for a specific project
 - **Run Godot Projects**: Execute Godot projects in debug mode
 - **Run Godot Scenes**: Execute a specific scene with configurable timeout and captured output
+- **Validate GDScript**: Check one or all project scripts and return structured errors
 - **Capture Debug Output**: Retrieve console output and error messages
 - **Control Execution**: Start and stop Godot projects programmatically
 - **Get Godot Version**: Retrieve the installed Godot version
@@ -138,6 +139,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "launch_editor",
         "run_project",
         "run_scene",
+        "validate_script",
         "get_debug_output",
         "stop_project",
         "get_godot_version",
