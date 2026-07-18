@@ -66,6 +66,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **Run Godot Scenes**: Execute a specific scene with configurable timeout and captured output
 - **Run Scene Tests**: Execute a test scene and return structured pass/fail results
 - **Export Projects**: Build release or debug exports from configured Godot presets
+- **Capture Game Screenshots**: Render a scene and save its viewport as a validated PNG
 - **Validate GDScript**: Check one or all project scripts and return structured errors
 - **Capture Debug Output**: Retrieve console output and error messages
 - **Control Execution**: Start and stop Godot projects programmatically
@@ -150,6 +151,28 @@ Use `export_project` to run a configured Godot export preset. Relative output pa
 
 The response reports the resolved output path and any Godot warnings. If the preset or matching export templates are missing, the tool explains how to configure them in the editor.
 
+### Capture a Game Screenshot
+
+Use `capture_game_screenshot` to launch a scene with rendering enabled, wait for it to settle, and save the viewport as a PNG. This tool requires a graphical display and does not use Godot's headless mode.
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `projectPath` | Yes | Path to the directory containing `project.godot` |
+| `scenePath` | Yes | A `res://` path or path relative to the project |
+| `outputPath` | Yes | Absolute `.png` path or path relative to the project directory |
+| `delayFrames` | No | Rendered frames to wait before capture; defaults to `30` |
+
+```json
+{
+  "projectPath": "/path/to/project",
+  "scenePath": "res://scenes/main.tscn",
+  "outputPath": "screenshots/main.png",
+  "delayFrames": 30
+}
+```
+
+The response includes the resolved output path, PNG dimensions, byte size, and Godot output. The destination directory is created automatically.
+
 ## Requirements
 
 - [Godot Engine](https://godotengine.org/download) installed on your system
@@ -193,6 +216,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "run_scene",
         "run_scene_test",
         "export_project",
+        "capture_game_screenshot",
         "validate_script",
         "get_debug_output",
         "stop_project",

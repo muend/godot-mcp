@@ -27,8 +27,11 @@ const DEBUG_MODE: boolean = process.env.DEBUG === 'true';
 const GODOT_DEBUG_MODE: boolean = true; // Always use GODOT DEBUG MODE
 const DEFAULT_SCENE_TIMEOUT_MS = 30000;
 const DEFAULT_SCENE_TEST_TIMEOUT_MS = 60000;
+const DEFAULT_SCREENSHOT_DELAY_FRAMES = 30;
 const MAX_SCENE_TIMEOUT_MS = 2147483647;
+const MAX_SCREENSHOT_DELAY_FRAMES = 3600;
 const PROCESS_EXIT_WAIT_MS = 1000;
+const SCREENSHOT_PROCESS_TIMEOUT_MS = 120000;
 const SCENE_TEST_POLL_INTERVAL_MS = 25;
 const SCENE_TEST_RAW_TAIL_LINES = 50;
 
@@ -98,6 +101,7 @@ class GodotServer {
   private activeProcess: GodotProcess | null = null;
   private godotPath: string | null = null;
   private operationsScriptPath: string;
+  private screenshotScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
 
@@ -165,6 +169,7 @@ class GodotServer {
 
     // Set the path to the operations script
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
+    this.screenshotScriptPath = join(__dirname, 'scripts', 'screenshot_runner.gd');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
 
     // Initialize the MCP server
@@ -821,6 +826,34 @@ class GodotServer {
           },
         },
         {
+          name: 'capture_game_screenshot',
+          description: 'Run a Godot scene and save a rendered viewport screenshot as PNG',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Scene to capture, as a res:// path or a path relative to the project',
+              },
+              outputPath: {
+                type: 'string',
+                description: 'PNG output path, absolute or relative to the project directory',
+              },
+              delayFrames: {
+                type: 'integer',
+                description: 'Rendered frames to wait before capture (default: 30)',
+                minimum: 0,
+                maximum: MAX_SCREENSHOT_DELAY_FRAMES,
+              },
+            },
+            required: ['projectPath', 'scenePath', 'outputPath'],
+          },
+        },
+        {
           name: 'validate_script',
           description: 'Validate one or all GDScript files in a Godot project',
           inputSchema: {
@@ -1090,6 +1123,8 @@ class GodotServer {
           return await this.handleRunSceneTest(request.params.arguments);
         case 'export_project':
           return await this.handleExportProject(request.params.arguments);
+        case 'capture_game_screenshot':
+          return await this.handleCaptureGameScreenshot(request.params.arguments);
         case 'validate_script':
           return await this.handleValidateScript(request.params.arguments);
         case 'get_debug_output':
@@ -1749,6 +1784,225 @@ class GodotServer {
         [
           'Open Project > Export in Godot and verify the preset configuration',
           'Ensure the output directory is writable',
+          'Check if the GODOT_PATH environment variable is set correctly',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the capture_game_screenshot tool
+   * @param args Tool arguments
+   */
+  private async handleCaptureGameScreenshot(args: unknown) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return this.createErrorResponse(
+        'Project path, scene path, and output path are required',
+        ['Provide projectPath, scenePath, and outputPath']
+      );
+    }
+
+    const rawArgs = args as Record<string, unknown>;
+    const projectPath = rawArgs.projectPath ?? rawArgs.project_path;
+    const scenePath = rawArgs.scenePath ?? rawArgs.scene_path;
+    const outputPath = rawArgs.outputPath ?? rawArgs.output_path;
+    const rawDelayFrames = rawArgs.delayFrames !== undefined
+      ? rawArgs.delayFrames
+      : rawArgs.delay_frames;
+    const delayFrames = rawDelayFrames === undefined
+      ? DEFAULT_SCREENSHOT_DELAY_FRAMES
+      : rawDelayFrames;
+
+    if (typeof projectPath !== 'string' || !projectPath.trim()) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (typeof scenePath !== 'string' || !scenePath.trim()) {
+      return this.createErrorResponse(
+        'Scene path is required',
+        ['Provide a res:// scene path or a path relative to the project']
+      );
+    }
+
+    if (typeof outputPath !== 'string' || !outputPath.trim()) {
+      return this.createErrorResponse(
+        'Output path is required',
+        ['Provide an absolute path or a path relative to the project ending in .png']
+      );
+    }
+
+    if (
+      typeof delayFrames !== 'number'
+      || !Number.isInteger(delayFrames)
+      || delayFrames < 0
+      || delayFrames > MAX_SCREENSHOT_DELAY_FRAMES
+    ) {
+      return this.createErrorResponse(
+        `delayFrames must be an integer between 0 and ${MAX_SCREENSHOT_DELAY_FRAMES}`,
+        [`Provide delayFrames, or omit it to use ${DEFAULT_SCREENSHOT_DELAY_FRAMES}`]
+      );
+    }
+
+    if (!this.validatePath(projectPath) || !this.validatePath(outputPath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide project and output paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    if (!this.validatePath(scenePath) || isAbsolute(scenePath)) {
+      return this.createErrorResponse(
+        'Invalid scene path',
+        ['Provide a res:// scene path or a path relative to the project without ".."']
+      );
+    }
+
+    if (!/\.(tscn|scn)$/i.test(scenePath)) {
+      return this.createErrorResponse(
+        'scenePath must point to a Godot scene file',
+        ['Provide a .tscn or .scn file']
+      );
+    }
+
+    if (!/\.png$/i.test(outputPath)) {
+      return this.createErrorResponse(
+        'outputPath must end in .png',
+        ['Provide a PNG destination path']
+      );
+    }
+
+    try {
+      const projectFile = join(projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      const projectRelativeScenePath = scenePath.startsWith('res://')
+        ? scenePath.slice('res://'.length)
+        : scenePath;
+      const normalizedResourcePath = projectRelativeScenePath.split('\\').join('/');
+      const sceneFile = join(projectPath, ...normalizedResourcePath.split('/'));
+      if (!existsSync(sceneFile)) {
+        return this.createErrorResponse(
+          `Scene does not exist: ${scenePath}`,
+          ['Ensure scenePath points to an existing scene in the project']
+        );
+      }
+
+      if (!existsSync(this.screenshotScriptPath)) {
+        return this.createErrorResponse(
+          `Screenshot runner is missing: ${this.screenshotScriptPath}`,
+          ['Run npm run build before starting the MCP server']
+        );
+      }
+
+      const resolvedOutputPath = isAbsolute(outputPath)
+        ? normalize(outputPath)
+        : resolve(projectPath, outputPath);
+      mkdirSync(dirname(resolvedOutputPath), { recursive: true });
+      const godotScenePath = `res://${normalizedResourcePath}`;
+      const cmdArgs = [
+        '--path',
+        projectPath,
+        '--script',
+        this.screenshotScriptPath,
+        '--',
+        godotScenePath,
+        resolvedOutputPath,
+        String(delayFrames),
+      ];
+      this.logDebug(`Capturing ${godotScenePath} to ${resolvedOutputPath}`);
+
+      const { stdout, stderr } = await execFileAsync(this.godotPath!, cmdArgs, {
+        timeout: SCREENSHOT_PROCESS_TIMEOUT_MS,
+        maxBuffer: 4 * 1024 * 1024,
+      });
+      if (!stdout.includes('SCREENSHOT_SAVED:')) {
+        return this.createErrorResponse(
+          'Godot exited without confirming that the screenshot was saved',
+          [
+            'Check the Godot output for viewport or image encoding errors',
+            'Ensure screenshot_runner.gd matches the installed MCP build',
+          ]
+        );
+      }
+
+      if (!existsSync(resolvedOutputPath)) {
+        return this.createErrorResponse(
+          `Godot finished without creating a screenshot: ${resolvedOutputPath}`,
+          [
+            'Ensure the scene can run with the configured display driver',
+            'Increase delayFrames if the scene needs more time to render',
+          ]
+        );
+      }
+
+      const pngData = readFileSync(resolvedOutputPath);
+      const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      if (pngData.length < 24 || !pngData.subarray(0, 8).equals(pngSignature)) {
+        return this.createErrorResponse(
+          `Screenshot output is not a valid PNG: ${resolvedOutputPath}`,
+          ['Check the Godot output for viewport or image encoding errors']
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                scenePath: godotScenePath,
+                outputPath: resolvedOutputPath,
+                delayFrames,
+                width: pngData.readUInt32BE(16),
+                height: pngData.readUInt32BE(20),
+                bytes: pngData.length,
+                output: stdout.trim(),
+                warnings: stderr.trim(),
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const execError = error instanceof Error
+        ? error as Error & { stdout?: string | Buffer; stderr?: string | Buffer; killed?: boolean }
+        : null;
+      const stdout = execError?.stdout?.toString().trim() ?? '';
+      const stderr = execError?.stderr?.toString().trim() ?? '';
+      const errorMessage = execError?.message ?? 'Unknown error';
+      const details = [stderr, stdout, errorMessage]
+        .filter((value, index, values) => value && values.indexOf(value) === index)
+        .join('\n');
+
+      if (execError?.killed) {
+        return this.createErrorResponse(
+          `Screenshot capture timed out after ${SCREENSHOT_PROCESS_TIMEOUT_MS} ms`,
+          [
+            'Ensure the scene starts without blocking dialogs',
+            'Reduce delayFrames or inspect the scene for startup errors',
+          ]
+        );
+      }
+
+      return this.createErrorResponse(
+        `Failed to capture game screenshot: ${details}`,
+        [
+          'Ensure Godot can open a rendered window in the current environment',
+          'Verify the project and scene paths are accessible',
           'Check if the GODOT_PATH environment variable is set correctly',
         ]
       );
