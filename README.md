@@ -65,6 +65,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **Run Godot Projects**: Execute Godot projects in debug mode
 - **Run Godot Scenes**: Execute a specific scene with configurable timeout and captured output
 - **Run Scene Tests**: Execute a test scene and return structured pass/fail results
+- **Export Projects**: Build release or debug exports from configured Godot presets
 - **Validate GDScript**: Check one or all project scripts and return structured errors
 - **Capture Debug Output**: Retrieve console output and error messages
 - **Control Execution**: Start and stop Godot projects programmatically
@@ -127,6 +128,28 @@ Use `run_scene_test` when an agent needs structured test results instead of raw 
 
 The response includes `completed`, pass/fail counts, matching lines, and the last 50 output lines in `rawTail`.
 
+### Export a Project
+
+Use `export_project` to run a configured Godot export preset. Relative output paths are resolved from the project directory, and missing output directories are created automatically.
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `projectPath` | Yes | Path to the directory containing `project.godot` |
+| `preset` | Yes | Exact preset name from `export_presets.cfg`, such as `Web` |
+| `outputPath` | Yes | Absolute path or path relative to the project directory |
+| `debug` | No | Uses `--export-debug` when true; defaults to a release export |
+
+```json
+{
+  "projectPath": "/path/to/project",
+  "preset": "Web",
+  "outputPath": "export/web/index.html",
+  "debug": false
+}
+```
+
+The response reports the resolved output path and any Godot warnings. If the preset or matching export templates are missing, the tool explains how to configure them in the editor.
+
 ## Requirements
 
 - [Godot Engine](https://godotengine.org/download) installed on your system
@@ -169,6 +192,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "run_project",
         "run_scene",
         "run_scene_test",
+        "export_project",
         "validate_script",
         "get_debug_output",
         "stop_project",

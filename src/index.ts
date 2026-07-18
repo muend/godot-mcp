@@ -8,7 +8,7 @@
  */
 
 import { fileURLToPath } from 'url';
-import { join, dirname, basename, normalize, isAbsolute, relative, sep } from 'path';
+import { join, dirname, basename, normalize, isAbsolute, relative, resolve, sep } from 'path';
 import { existsSync, readdirSync, mkdirSync, readFileSync } from 'fs';
 import { spawn, execFile, type ChildProcessWithoutNullStreams } from 'child_process';
 import { promisify } from 'util';
@@ -795,6 +795,32 @@ class GodotServer {
           },
         },
         {
+          name: 'export_project',
+          description: 'Export a Godot project using a configured export preset',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              preset: {
+                type: 'string',
+                description: 'Name of an export preset configured in export_presets.cfg',
+              },
+              outputPath: {
+                type: 'string',
+                description: 'Export file path, absolute or relative to the project directory',
+              },
+              debug: {
+                type: 'boolean',
+                description: 'Use a debug export instead of a release export (default: false)',
+              },
+            },
+            required: ['projectPath', 'preset', 'outputPath'],
+          },
+        },
+        {
           name: 'validate_script',
           description: 'Validate one or all GDScript files in a Godot project',
           inputSchema: {
@@ -1062,6 +1088,8 @@ class GodotServer {
           return await this.handleRunScene(request.params.arguments);
         case 'run_scene_test':
           return await this.handleRunSceneTest(request.params.arguments);
+        case 'export_project':
+          return await this.handleExportProject(request.params.arguments);
         case 'validate_script':
           return await this.handleValidateScript(request.params.arguments);
         case 'get_debug_output':
@@ -1554,6 +1582,174 @@ class GodotServer {
           'Ensure Godot is installed correctly',
           'Check if the GODOT_PATH environment variable is set correctly',
           'Verify the project and scene paths are accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the export_project tool
+   * @param args Tool arguments
+   */
+  private async handleExportProject(args: unknown) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return this.createErrorResponse(
+        'Project path, preset, and output path are required',
+        ['Provide projectPath, preset, and outputPath']
+      );
+    }
+
+    const rawArgs = args as Record<string, unknown>;
+    const projectPath = rawArgs.projectPath ?? rawArgs.project_path;
+    const preset = rawArgs.preset;
+    const outputPath = rawArgs.outputPath ?? rawArgs.output_path;
+    const debug = rawArgs.debug === undefined ? false : rawArgs.debug;
+
+    if (typeof projectPath !== 'string' || !projectPath.trim()) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (typeof preset !== 'string' || !preset.trim()) {
+      return this.createErrorResponse(
+        'Export preset is required',
+        ['Provide the exact name of a preset from export_presets.cfg']
+      );
+    }
+
+    if (typeof outputPath !== 'string' || !outputPath.trim()) {
+      return this.createErrorResponse(
+        'Output path is required',
+        ['Provide an export file path, such as export/web/index.html']
+      );
+    }
+
+    if (typeof debug !== 'boolean') {
+      return this.createErrorResponse(
+        'debug must be a boolean',
+        ['Use true for a debug export or false for a release export']
+      );
+    }
+
+    if (!this.validatePath(projectPath) || !this.validatePath(outputPath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide project and output paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      const projectFile = join(projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      const resolvedOutputPath = isAbsolute(outputPath)
+        ? normalize(outputPath)
+        : resolve(projectPath, outputPath);
+      mkdirSync(dirname(resolvedOutputPath), { recursive: true });
+
+      const exportFlag = debug ? '--export-debug' : '--export-release';
+      const cmdArgs = [
+        '--headless',
+        '--path',
+        projectPath,
+        exportFlag,
+        preset,
+        resolvedOutputPath,
+      ];
+      this.logDebug(
+        `Exporting Godot project with preset ${preset} to ${resolvedOutputPath}`
+      );
+
+      const { stdout, stderr } = await execFileAsync(this.godotPath!, cmdArgs);
+      if (!existsSync(resolvedOutputPath)) {
+        return this.createErrorResponse(
+          `Godot finished without creating the expected export: ${resolvedOutputPath}`,
+          [
+            'Check the export preset output type and destination',
+            'Open Project > Export in Godot and verify the preset configuration',
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                preset,
+                outputPath: resolvedOutputPath,
+                debug,
+                output: stdout.trim(),
+                warnings: stderr.trim(),
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const execError = error instanceof Error
+        ? error as Error & { stdout?: string | Buffer; stderr?: string | Buffer }
+        : null;
+      const stdout = execError?.stdout?.toString().trim() ?? '';
+      const stderr = execError?.stderr?.toString().trim() ?? '';
+      const errorMessage = execError?.message ?? 'Unknown error';
+      const details = [stderr, stdout, errorMessage]
+        .filter((value, index, values) => value && values.indexOf(value) === index)
+        .join('\n');
+
+      if (/doesn'?t have an? [`']?export_presets\.cfg|no export presets/i.test(details)) {
+        return this.createErrorResponse(
+          'No export presets are configured for this project',
+          [
+            'Open the project in Godot and create a preset under Project > Export',
+            'Commit export_presets.cfg if the preset should be shared with the project',
+          ]
+        );
+      }
+
+      if (
+        /preset.*(?:not found|does not exist)|couldn'?t find.*preset|invalid export preset name/i
+          .test(details)
+      ) {
+        return this.createErrorResponse(
+          `Export preset "${preset}" was not found`,
+          [
+            'Open the project in Godot and create the preset under Project > Export',
+            'Use the preset name exactly as it appears in export_presets.cfg',
+          ]
+        );
+      }
+
+      if (/export template|templates.*(?:missing|not found|not installed)/i.test(details)) {
+        return this.createErrorResponse(
+          `Export templates required by preset "${preset}" are not installed`,
+          [
+            'Install the matching templates from Editor > Manage Export Templates in Godot',
+            'Retry the export after the templates are installed',
+          ]
+        );
+      }
+
+      return this.createErrorResponse(
+        `Failed to export project with preset "${preset}": ${details}`,
+        [
+          'Open Project > Export in Godot and verify the preset configuration',
+          'Ensure the output directory is writable',
+          'Check if the GODOT_PATH environment variable is set correctly',
         ]
       );
     }
